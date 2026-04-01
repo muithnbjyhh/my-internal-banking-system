@@ -1,0 +1,169 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	_ "github.com/lib/pq" // PostgreSQL driver
+)
+
+// APIResponse standardizes the structure of all outbound HTTP responses
+type APIResponse struct {
+	Status  int         `json:"status"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+func main() {
+	// 1. Initialize Structured Logging
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	slog.Info("Bootstrapping my-internal-banking-system...")
+
+	// 2. Configure Database Connection (Core Ledger)
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://ledger_admin:secure_password@localhost:5432/internal_bank?sslmode=disable"
+	}
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		slog.Error("Failed to open database connection", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	// Configure connection pool for high-concurrency transaction processing
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		slog.Error("Failed to ping database", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("Immutable Ledger database connection established.")
+
+	// 3. Configure API Router
+	mux := http.NewServeMux()
+
+	// System Health
+	mux.HandleFunc("/api/v1/health", healthCheckHandler(db))
+
+	// Core Endpoints (Stubs for demonstration in main.go)
+	mux.HandleFunc("/api/v1/accounts/create", methodAllowed(http.MethodPost, createAccountHandler))
+	mux.HandleFunc("/api/v1/transactions/transfer", methodAllowed(http.MethodPost, transferHandler))
+
+	// 4. Server Configuration
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// 5. Graceful Shutdown Implementation
+	// Ensures in-flight ACID transactions complete before the server shuts down.
+	go func() {
+		slog.Info("Server listening", "port", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Listen and serve error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	slog.Info("Shutdown signal received, shutting down gracefully...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("Server forced to shutdown", "error", err)
+	}
+
+	slog.Info("Server exited.")
+}
+
+// --- Middleware & Handlers ---
+
+// methodAllowed acts as a simple middleware to restrict HTTP methods
+func methodAllowed(method string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(APIResponse{
+				Status:  http.StatusMethodNotAllowed,
+				Message: fmt.Sprintf("Method %s not allowed", r.Method),
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// healthCheckHandler verifies server and database status
+func healthCheckHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		dbStatus := "Healthy"
+		if err := db.Ping(); err != nil {
+			dbStatus = "Degraded"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  http.StatusOK,
+			Message: "System API Operational",
+			Data: map[string]string{
+				"database": dbStatus,
+				"version":  "1.0.0",
+			},
+		})
+	}
+}
+
+// createAccountHandler provisions a new internal holding account
+func createAccountHandler(w http.ResponseWriter, r *http.Request) {
+	// Implementation for parsing JSON, validating RBAC, and inserting into DB
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(APIResponse{
+		Status:  http.StatusCreated,
+		Message: "Account provisioned successfully",
+	})
+}
+
+// transferHandler initiates an ACID-compliant transfer between accounts
+func transferHandler(w http.ResponseWriter, r *http.Request) {
+	// Implementation for double-entry bookkeeping logic, AI anomaly check trigger
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(APIResponse{
+		Status:  http.StatusOK,
+		Message: "Transfer executed successfully",
+	})
+}
